@@ -1,4 +1,4 @@
-// led_test2.cpp — SetFeature + комбинации как у G HUB
+// led_test3.cpp — SET_REPORT Output (как G HUB)
 #include <windows.h>
 #include <setupapi.h>
 #include <hidsdi.h>
@@ -27,14 +27,18 @@ bool HidRead(HANDLE h, std::vector<BYTE>& buf, DWORD ms) {
     ok = GetOverlappedResult(h, &ov, &r, FALSE); buf.resize(r); CloseHandle(ov.hEvent); return ok;
 }
 
-void PrintBytes(const char* prefix, const std::vector<BYTE>& v) {
-    printf("%s", prefix);
-    for (BYTE b : v) printf("%02x ", b);
-    printf("\n");
+void ReadResp(const char* label) {
+    std::vector<BYTE> resp(20);
+    if (HidRead(g_hDevice, resp, 500)) {
+        printf("%s", label);
+        for (BYTE b : resp) printf("%02x ", b);
+        printf("\n");
+    } else {
+        printf("%s (no data)\n", label);
+    }
 }
 
-// Отправка через SET_REPORT Feature (control transfer) — как делает G HUB
-bool SendFeature(BYTE featureIdx, BYTE func, const std::vector<BYTE>& args) {
+bool SendOutput(BYTE featureIdx, BYTE func, const std::vector<BYTE>& args) {
     std::vector<BYTE> req(20, 0);
     req[0] = 0x11;
     req[1] = 0xFF;
@@ -46,21 +50,12 @@ bool SendFeature(BYTE featureIdx, BYTE func, const std::vector<BYTE>& args) {
     for (BYTE b : req) printf("%02x ", b);
     printf("\n");
 
-    if (!HidD_SetFeature(g_hDevice, req.data(), 20)) {
-        printf("    SetFeature FAILED (err=%lu)\n", GetLastError());
+    if (!HidD_SetOutputReport(g_hDevice, req.data(), 20)) {
+        printf("    SetOutputReport FAILED (err=%lu)\n", GetLastError());
         return false;
     }
     printf("    (sent OK)\n");
     return true;
-}
-
-void ReadResp(const char* label) {
-    std::vector<BYTE> resp(20);
-    if (HidRead(g_hDevice, resp, 300)) {
-        PrintBytes(label, resp);
-    } else {
-        printf("%s (no data)\n", label);
-    }
 }
 
 std::wstring FindHidpp(USHORT vid, USHORT* outPid) {
@@ -101,7 +96,7 @@ std::wstring FindHidpp(USHORT vid, USHORT* outPid) {
 }
 
 int main() {
-    printf("=== LED Test v2: SetFeature + Combo ===\n\n");
+    printf("=== LED Test v3: SET_REPORT Output ===\n\n");
 
     USHORT pid = 0;
     std::wstring path = FindHidpp(0x046d, &pid);
@@ -113,59 +108,54 @@ int main() {
 
     const BYTE F = 0x0e;
 
-    // 1. Пробуем как G HUB: func 6 с f2e2, потом func 1
-    printf("\n### 1. SetFeature func 6 (как G HUB) ###\n");
-    SendFeature(F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00});
-    Sleep(100);
-    ReadResp("    << ");
-    printf("\n--- смотрим на мышь ---\n");
-
-    printf("\n### 2. SetFeature func 1 (как G HUB) ###\n");
-    SendFeature(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00});
+    printf("\n### 1. func 6 (как G HUB): [00 00 f2 e2 00 00 00] ###\n");
+    SendOutput(F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00});
     Sleep(100);
     ReadResp("    << ");
 
-    printf("\n>>> Цвет изменился? Нажми Enter.\n");
+    printf("\n### 2. func 1 (как G HUB): [00 00 f2 e2 00 00 00] ###\n");
+    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00});
+    Sleep(100);
+    ReadResp("    << ");
+
+    printf("\n>>> Цвет изменился? Enter...\n");
     getchar();
 
-    // 3. С красным цветом
     printf("\n### 3. func 6 + func 1, красный (ff 00 00) ###\n");
-    SendFeature(F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
-    Sleep(100);
+    SendOutput(F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
+    Sleep(200);
     ReadResp("    << ");
-    SendFeature(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
-    Sleep(100);
+    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
+    Sleep(200);
     ReadResp("    << ");
 
-    printf("\n>>> Мышь КРАСНАЯ? Enter.\n");
+    printf("\n>>> Мышь КРАСНАЯ? Enter...\n");
     getchar();
 
-    // 4. Разные варианты через func 1
-    printf("\n### 4. func 1: [00 01 FF 00 00] (zone=0, effect=1, R=FF) ###\n");
-    SendFeature(F, 0x01, {0x00, 0x01, 0xFF, 0x00, 0x00});
-    Sleep(100);
+    printf("\n### 4. func 1: [00 01 FF 00 00] ###\n");
+    SendOutput(F, 0x01, {0x00, 0x01, 0xFF, 0x00, 0x00});
+    Sleep(200);
     ReadResp("    << ");
 
-    printf("\n### 5. func 1: [00 01 00 FF 00 00] (с persistence) ###\n");
-    SendFeature(F, 0x01, {0x00, 0x01, 0x00, 0xFF, 0x00, 0x00});
-    Sleep(100);
+    printf("\n### 5. func 1: [00 01 00 FF 00 00] ###\n");
+    SendOutput(F, 0x01, {0x00, 0x01, 0x00, 0xFF, 0x00, 0x00});
+    Sleep(200);
     ReadResp("    << ");
 
-    printf("\n### 6. func 1: [00 FF 00 00] (zone=0, R=FF) ###\n");
-    SendFeature(F, 0x01, {0x00, 0xFF, 0x00, 0x00});
-    Sleep(100);
-    ReadResp("    << ");
-
-    printf("\n>>> Мышь КРАСНАЯ? Enter.\n");
+    printf("\n>>> Мышь КРАСНАЯ? Enter...\n");
     getchar();
 
-    // 7. Другой цвет — синий
-    printf("\n### 7. Синий через func 1: [00 00 F2 E2 00 00 FF] ###\n");
-    SendFeature(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0xFF});
-    Sleep(100);
+    printf("\n### 6. func 1: [00 FF 00 00] ###\n");
+    SendOutput(F, 0x01, {0x00, 0xFF, 0x00, 0x00});
+    Sleep(200);
     ReadResp("    << ");
 
-    printf("\n>>> Мышь СИНЯЯ? Enter.\n");
+    printf("\n### 7. func 1 синий: [00 00 F2 E2 00 00 FF] ###\n");
+    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0xFF});
+    Sleep(200);
+    ReadResp("    << ");
+
+    printf("\n>>> Мышь СИНЯЯ? Enter...\n");
     getchar();
 
     CloseHandle(g_hDevice);
