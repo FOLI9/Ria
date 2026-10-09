@@ -1,145 +1,222 @@
-// led_test4.cpp — SetSWControl + установка цвета
-#include <windows.h>
-#include <setupapi.h>
-#include <hidsdi.h>
-#include <hidpi.h>
+// g102_test — консольная утилита для проверки связи с Logitech G102/G203
+// через HID++ (interface 1, endpoint 0x82).
+//
+// Сборка:
+//   mkdir build && cd build
+//   cmake .. -DCMAKE_BUILD_TYPE=Release
+//   cmake --build .
+//
+// Запуск:
+//   ./g102_test                 // interface=1, любой serial
+//   ./g102_test 0               // interface=0 (мышь, boot protocol)
+//   ./g102_test 1 162AE4510D14  // interface=1 + конкретный serial
+
+#include <hidapi/hidapi.h>
+
+#include <cstdint>
 #include <cstdio>
-#include <vector>
+#include <cstring>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
-#pragma comment(lib, "setupapi.lib")
-#pragma comment(lib, "hid.lib")
+static constexpr uint16_t VID = 0x046D;   // Logitech
+static constexpr uint16_t PID = 0xC092;   // G102 / G203 LIGHTSYNC
 
-HANDLE g_hDevice = INVALID_HANDLE_VALUE;
+// ---------- helpers ----------
 
-HANDLE OpenHid(const std::wstring& path) {
-    return CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED, nullptr);
+static void print_hex(const char* label,
+                      const std::vector<uint8_t>& data)
+{
+    std::printf("%s (%zu bytes): ", label, data.size());
+    for (auto b : data) std::printf("%02X ", b);
+    std::printf("\n");
 }
-bool HidRead(HANDLE h, std::vector<BYTE>& buf, DWORD ms) {
-    OVERLAPPED ov{}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    DWORD r = 0;
-    BOOL ok = ReadFile(h, buf.data(), (DWORD)buf.size(), &r, &ov);
-    if (!ok && GetLastError() != ERROR_IO_PENDING) { CloseHandle(ov.hEvent); return false; }
-    if (WaitForSingleObject(ov.hEvent, ms) != WAIT_OBJECT_0) { CancelIo(h); CloseHandle(ov.hEvent); return false; }
-    ok = GetOverlappedResult(h, &ov, &r, FALSE); buf.resize(r); CloseHandle(ov.hEvent); return ok;
-}
-void ReadResp() {
-    std::vector<BYTE> resp(20);
-    if (HidRead(g_hDevice, resp, 500)) {
-        printf("    << ");
-        for (BYTE b : resp) printf("%02x ", b);
-        printf("\n");
-    } else printf("    << (no data)\n");
-}
-bool SendOutput(BYTE featureIdx, BYTE func, std::vector<BYTE> args) {
-    std::vector<BYTE> req(20, 0);
-    req[0] = 0x11; req[1] = 0xFF; req[2] = featureIdx;
-    req[3] = (BYTE)((func << 4) | 0x01);
-    for (size_t i = 0; i < args.size() && i < 16; ++i) req[4 + i] = args[i];
-    printf("    >> ");
-    for (BYTE b : req) printf("%02x ", b);
-    printf("\n");
-    if (!HidD_SetOutputReport(g_hDevice, req.data(), 20)) {
-        printf("    SetOutputReport FAILED (err=%lu)\n", GetLastError());
-        return false;
+
+static void list_devices()
+{
+    std::printf("-- Поиск Logitech %04X:%04X --\n", VID, PID);
+
+    hid_device_info* list = hid_enumerate(VID, PID);
+    if (!list) {
+        std::printf("Устройство не найдено.\n");
+        return;
     }
-    printf("    (sent OK)\n");
-    return true;
+
+    for (hid_device_info* d = list; d; d = d->next) {
+        std::printf("  path=%ls\n", d->path);
+        std::printf("    interface_number = %d\n", d->interface_number);
+        std::printf("    usage_page       = 0x%04X\n", d->usage_page);
+        std::printf("    usage            = 0x%04X\n", d->usage);
+        std::printf("    serial           = %ls\n",
+                    d->serial_number ? d->serial_number : L"(нет)");
+        std::printf("    manufacturer     = %ls\n",
+                    d->manufacturer_string ? d->manufacturer_string : L"(нет)");
+        std::printf("    product          = %ls\n",
+                    d->product_string ? d->product_string : L"(нет)");
+    }
+    hid_free_enumeration(list);
+    std::printf("--\n\n");
 }
-std::wstring FindHidpp(USHORT vid, USHORT* outPid) {
-    GUID g; HidD_GetHidGuid(&g);
-    HDEVINFO di = SetupDiGetClassDevs(&g, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (di == INVALID_HANDLE_VALUE) return {};
-    SP_DEVICE_INTERFACE_DATA id{}; id.cbSize = sizeof(id);
-    std::wstring found;
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(di, nullptr, &g, i, &id); ++i) {
-        DWORD need = 0;
-        SetupDiGetDeviceInterfaceDetail(di, &id, nullptr, 0, &need, nullptr);
-        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) continue;
-        std::vector<BYTE> buf(need);
-        auto* d = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
-        d->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-        if (!SetupDiGetDeviceInterfaceDetail(di, &id, d, need, nullptr, nullptr)) continue;
-        std::wstring p = d->DevicePath;
-        HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        HIDD_ATTRIBUTES at{}; at.Size = sizeof(at);
-        if (HidD_GetAttributes(h, &at) && at.VendorID == vid) {
-            PHIDP_PREPARSED_DATA pp = nullptr;
-            if (HidD_GetPreparsedData(h, &pp)) {
-                HIDP_CAPS c{};
-                if (HidP_GetCaps(pp, &c) == HIDP_STATUS_SUCCESS &&
-                    c.InputReportByteLength >= 20 && c.OutputReportByteLength >= 20) {
-                    found = p; if (outPid) *outPid = at.ProductID;
-                }
-                HidD_FreePreparsedData(pp);
+
+// ---------- открытие ----------
+
+static hid_device* open_g102(int interface,
+                             const std::optional<std::string>& serial)
+{
+    hid_device_info* list = hid_enumerate(VID, PID);
+    if (!list) throw std::runtime_error("G102 не найдена (hid_enumerate)");
+
+    hid_device* dev = nullptr;
+
+    for (hid_device_info* d = list; d; d = d->next) {
+        // На Windows hidapi иногда возвращает -1 для interface_number,
+        // тогда fallback'ом считаем, что это interface 0 (boot mouse).
+        bool iface_ok = (d->interface_number == interface) ||
+                        (d->interface_number == -1 && interface == 0);
+
+        bool serial_ok = true;
+        if (serial) {
+            if (!d->serial_number) {
+                serial_ok = false;
+            } else {
+                // serial_number — wchar_t*, сравниваем через string
+                std::wstring w(d->serial_number);
+                std::string s(w.begin(), w.end());
+                serial_ok = (s == *serial);
             }
         }
-        CloseHandle(h);
-        if (!found.empty()) break;
+
+        if (iface_ok && serial_ok) {
+            dev = hid_open_path(d->path);
+            if (dev) break;
+        }
     }
-    SetupDiDestroyDeviceInfoList(di);
-    return found;
+
+    hid_free_enumeration(list);
+
+    if (!dev)
+        throw std::runtime_error("Не удалось открыть G102 (interface " +
+                                 std::to_string(interface) + ")");
+
+    hid_set_nonblocking(dev, 1);
+    return dev;
 }
 
-int main() {
-    printf("=== LED Test v4: SetSWControl + Color ===\n\n");
-    USHORT pid = 0;
-    std::wstring path = FindHidpp(0x046d, &pid);
-    if (path.empty()) { printf("not found\n"); getchar(); return 1; }
-    printf("Found PID=0x%04x\n", pid);
-    g_hDevice = OpenHid(path);
-    if (g_hDevice == INVALID_HANDLE_VALUE) { printf("open failed\n"); getchar(); return 1; }
+// ---------- чтение / запись ----------
 
-    const BYTE F = 0x0e; // feature 0x8071 (RGB Effects)
+static std::vector<uint8_t> read_report(hid_device* dev, int timeout_ms)
+{
+    std::vector<uint8_t> buf(64, 0);
+    int n = hid_read_timeout(dev, buf.data(), buf.size(), timeout_ms);
+    if (n <= 0) return {};
+    buf.resize(n);
+    return buf;
+}
 
-    // 1. Пробуем "взять контроль" (SetSWControl)
-    printf("\n### 1. SetSWControl (func 5? пробуем) ###\n");
-    SendOutput(F, 0x05, {0x01}); // mode=1 (software control)
-    Sleep(200); ReadResp();
+static void write_report(hid_device* dev,
+                         const std::vector<uint8_t>& data)
+{
+    if (hid_write(dev, data.data(), data.size()) < 0)
+        throw std::runtime_error("hid_write() failed");
+}
 
-    printf("\n### 2. SetSWControl (func 1, arg=1) ###\n");
-    SendOutput(F, 0x01, {0x01});
-    Sleep(200); ReadResp();
+// ---------- HID++ ----------
 
-    printf("\n>>> Мышь мигнула? Enter...\n"); getchar();
+// report_id: 0x10 (short, 7 байт) или 0x11 (long, 20 байт)
+static void hidpp_send(hid_device* dev,
+                       uint8_t report_id,
+                       uint8_t device_index,
+                       uint8_t feature_index,
+                       uint8_t function,
+                       const std::vector<uint8_t>& params = {})
+{
+    size_t size = (report_id == 0x10) ? 7 : 20;
 
-    // 3. Пробуем "взять контроль" через Onboard Profiles (0x8100)
-    printf("\n### 3. Onboard Profiles (0x8100): func 1, arg=1 (host mode?) ###\n");
-    SendOutput(0x0f, 0x01, {0x01});
-    Sleep(300); ReadResp();
+    std::vector<uint8_t> pkt(size, 0);
+    pkt[0] = report_id;
+    pkt[1] = device_index;
+    pkt[2] = feature_index;
+    pkt[3] = function;
 
-    printf("\n### 4. Onboard Profiles: func 1, arg=0 ###\n");
-    SendOutput(0x0f, 0x01, {0x00});
-    Sleep(300); ReadResp();
+    for (size_t i = 0; i < params.size() && (4 + i) < size; ++i)
+        pkt[4 + i] = params[i];
 
-    printf("\n>>> Режим изменился? Enter...\n"); getchar();
+    write_report(dev, pkt);
+}
 
-    // 5. Теперь пробуем цвет
-    printf("\n### 5. RED через func 1 ###\n");
-    SendOutput(F, 0x01, {0x00, 0x01, 0xFF, 0x00, 0x00});
-    Sleep(300); ReadResp();
+// Ping через root feature (feature index 0x00, function 0x01).
+// Ответ: 10 FF 00 01 00 00 00 (успех) или ... 01 ... (ошибка).
+static bool hidpp_ping(hid_device* dev)
+{
+    std::printf(">> HID++ ping (root feature 0x00, function 0x01)\n");
+    hidpp_send(dev, 0x10, 0xFF, 0x00, 0x01);
 
-    printf("\n### 6. RED через func 1 с persistence ###\n");
-    SendOutput(F, 0x01, {0x00, 0x01, 0x00, 0xFF, 0x00, 0x00});
-    Sleep(300); ReadResp();
+    auto resp = read_report(dev, 500);
+    if (resp.empty()) {
+        std::printf("<< ответа нет\n");
+        return false;
+    }
 
-    printf("\n### 7. RED через func 1 + f2e2 ###\n");
-    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
-    Sleep(300); ReadResp();
+    print_hex("<<", resp);
 
-    printf("\n>>> Мышь КРАСНАЯ? Enter...\n"); getchar();
+    if (resp.size() >= 5 && resp[0] == 0x10 && resp[2] == 0x00) {
+        if (resp[4] == 0x00) {
+            std::printf("   ping OK\n");
+            return true;
+        }
+        std::printf("   ping вернул код ошибки 0x%02X\n", resp[4]);
+        return false;
+    }
+    std::printf("   неожиданный ответ\n");
+    return false;
+}
 
-    // 8. Синий
-    printf("\n### 8. BLUE ###\n");
-    SendOutput(F, 0x01, {0x00, 0x01, 0x00, 0x00, 0xFF});
-    Sleep(300); ReadResp();
+// ---------- main ----------
 
-    printf("\n>>> Мышь СИНЯЯ? Enter...\n"); getchar();
+int main(int argc, char** argv)
+{
+    try {
+        if (hid_init() != 0) {
+            std::fprintf(stderr, "hid_init() failed\n");
+            return 1;
+        }
 
-    CloseHandle(g_hDevice);
-    printf("\nDone.\n"); getchar(); return 0;
+        int interface = 1;
+        std::optional<std::string> serial;
+
+        if (argc >= 2) interface = std::atoi(argv[1]);
+        if (argc >= 3) serial = std::string(argv[2]);
+
+        list_devices();
+
+        std::printf("Открываю G102: interface=%d", interface);
+        if (serial) std::printf(", serial=%s", serial->c_str());
+        std::printf("\n");
+
+        hid_device* dev = open_g102(interface, serial);
+        std::printf("Открыто.\n\n");
+
+        // 1) Ping
+        bool ok = hidpp_ping(dev);
+
+        // 2) Дополнительно можно сюда добавлять свои команды,
+        //    например, запрос feature ID для подсветки:
+        //
+        //    hidpp_send(dev, 0x11, 0xFF, 0x00, 0x00,
+        //               { 0x00, 0x80 }); // Feature ID для 0x8040
+        //
+        //    auto r = read_report(dev, 500);
+        //    print_hex("feature id reply", r);
+
+        hid_close(dev);
+        hid_exit();
+
+        return ok ? 0 : 2;
+    }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "Ошибка: %s\n", e.what());
+        return 1;
+    }
 }
