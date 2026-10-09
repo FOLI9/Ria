@@ -3,3 +3,220 @@ https://www.cheatengine.org/
 https://github.com/x64dbg/x64dbg
 https://ghidra-sre.org/
 https://hex-rays.com/ida-free/
+
+
+
+// led_test.cpp — перебор вариантов управления подсветкой G102
+#include <windows.h>
+#include <setupapi.h>
+#include <hidsdi.h>
+#include <hidpi.h>
+#include <cstdio>
+#include <vector>
+#include <string>
+
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "hid.lib")
+
+HANDLE g_hDevice = INVALID_HANDLE_VALUE;
+
+HANDLE OpenHid(const std::wstring& path) {
+    return CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED, nullptr);
+}
+bool HidWrite(HANDLE h, const std::vector<BYTE>& buf, DWORD ms) {
+    OVERLAPPED ov{}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    DWORD w = 0;
+    BOOL ok = WriteFile(h, buf.data(), (DWORD)buf.size(), &w, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) { CloseHandle(ov.hEvent); return false; }
+    if (WaitForSingleObject(ov.hEvent, ms) != WAIT_OBJECT_0) { CancelIo(h); CloseHandle(ov.hEvent); return false; }
+    ok = GetOverlappedResult(h, &ov, &w, FALSE); CloseHandle(ov.hEvent); return ok;
+}
+bool HidRead(HANDLE h, std::vector<BYTE>& buf, DWORD ms) {
+    OVERLAPPED ov{}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    DWORD r = 0;
+    BOOL ok = ReadFile(h, buf.data(), (DWORD)buf.size(), &r, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) { CloseHandle(ov.hEvent); return false; }
+    if (WaitForSingleObject(ov.hEvent, ms) != WAIT_OBJECT_0) { CancelIo(h); CloseHandle(ov.hEvent); return false; }
+    ok = GetOverlappedResult(h, &ov, &r, FALSE); buf.resize(r); CloseHandle(ov.hEvent); return ok;
+}
+
+// Отправка HID++ через WriteFile (interrupt OUT)
+bool HidppWrite(HANDLE h, BYTE featureIdx, BYTE func, const std::vector<BYTE>& args, std::vector<BYTE>& resp) {
+    std::vector<BYTE> req(20, 0);
+    req[0] = 0x11;
+    req[1] = 0xFF;
+    req[2] = featureIdx;
+    req[3] = (BYTE)((func << 4) | 0x01);
+    for (size_t i = 0; i < args.size() && i < 16; ++i) req[4 + i] = args[i];
+
+    printf("    >> ");
+    for (BYTE b : req) printf("%02x ", b);
+    printf("\n");
+
+    if (!HidWrite(h, req, 300)) { printf("    WRITE FAILED\n"); return false; }
+    resp.assign(20, 0);
+    if (!HidRead(h, resp, 300)) { printf("    READ TIMEOUT\n"); return false; }
+
+    printf("    << ");
+    for (BYTE b : resp) printf("%02x ", b);
+    printf("\n");
+
+    if (resp.size() >= 3 && resp[2] == 0xFF) {
+        printf("    *** ERR 0x%02x ***\n", resp.size() >= 6 ? resp[5] : 0);
+        return false;
+    }
+    printf("    >>> OK\n");
+    return true;
+}
+
+// Отправка HID++ через Set_Report (control transfer) — G HUB использует именно этот способ!
+bool HidppSetReport(HANDLE h, BYTE featureIdx, BYTE func, const std::vector<BYTE>& args, std::vector<BYTE>& resp) {
+    std::vector<BYTE> req(20, 0);
+    req[0] = 0x11;
+    req[1] = 0xFF;
+    req[2] = featureIdx;
+    req[3] = (BYTE)((func << 4) | 0x01);
+    for (size_t i = 0; i < args.size() && i < 16; ++i) req[4 + i] = args[i];
+
+    printf("    >> ");
+    for (BYTE b : req) printf("%02x ", b);
+    printf("\n");
+
+    if (!HidD_SetOutputReport(h, req.data(), (ULONG)req.size())) {
+        printf("    SetOutputReport FAILED (err=%lu)\n", GetLastError());
+        return false;
+    }
+
+    Sleep(30);
+
+    resp.assign(20, 0);
+    if (!HidRead(h, resp, 300)) { printf("    READ TIMEOUT\n"); return false; }
+
+    printf("    << ");
+    for (BYTE b : resp) printf("%02x ", b);
+    printf("\n");
+
+    if (resp.size() >= 3 && resp[2] == 0xFF) {
+        printf("    *** ERR 0x%02x ***\n", resp.size() >= 6 ? resp[5] : 0);
+        return false;
+    }
+    printf("    >>> OK\n");
+    return true;
+}
+
+std::wstring FindHidpp(USHORT vid, USHORT* outPid) {
+    GUID g; HidD_GetHidGuid(&g);
+    HDEVINFO di = SetupDiGetClassDevs(&g, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (di == INVALID_HANDLE_VALUE) return {};
+    SP_DEVICE_INTERFACE_DATA id{}; id.cbSize = sizeof(id);
+    std::wstring found;
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(di, nullptr, &g, i, &id); ++i) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetail(di, &id, nullptr, 0, &need, nullptr);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) continue;
+        std::vector<BYTE> buf(need);
+        auto* d = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA>(buf.data());
+        d->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+        if (!SetupDiGetDeviceInterfaceDetail(di, &id, d, need, nullptr, nullptr)) continue;
+        std::wstring p = d->DevicePath;
+        HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        HIDD_ATTRIBUTES at{}; at.Size = sizeof(at);
+        if (HidD_GetAttributes(h, &at) && at.VendorID == vid) {
+            PHIDP_PREPARSED_DATA pp = nullptr;
+            if (HidD_GetPreparsedData(h, &pp)) {
+                HIDP_CAPS c{};
+                if (HidP_GetCaps(pp, &c) == HIDP_STATUS_SUCCESS &&
+                    c.InputReportByteLength >= 20 && c.OutputReportByteLength >= 20) {
+                    found = p; if (outPid) *outPid = at.ProductID;
+                }
+                HidD_FreePreparsedData(pp);
+            }
+        }
+        CloseHandle(h);
+        if (!found.empty()) break;
+    }
+    SetupDiDestroyDeviceInfoList(di);
+    return found;
+}
+
+int main() {
+    printf("=== LED Bruteforce Test for G102 ===\n\n");
+
+    USHORT pid = 0;
+    std::wstring path = FindHidpp(0x046d, &pid);
+    if (path.empty()) { printf("Mouse not found\n"); getchar(); return 1; }
+    printf("Found: PID=0x%04x\n\n", pid);
+
+    g_hDevice = OpenHid(path);
+    if (g_hDevice == INVALID_HANDLE_VALUE) { printf("Open failed\n"); getchar(); return 1; }
+
+    // Установить красный цвет (R=255 G=0 B=0) через фичу 0x0e (0x8071 RGB Effects)
+    const BYTE F = 0x0e;
+    std::vector<BYTE> resp;
+
+    printf("=== Пробуем функцию 1 с разными вариантами ===\n\n");
+
+    // Вариант A: z=0, effect=1, persist=0, R, G, B (как мы пробовали для func 3)
+    printf("[A] func 1: [00 01 00 ff 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x01, {0x00, 0x01, 0x00, 0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    // Вариант B: z=0, effect=1, R, G, B (без persistence)
+    printf("\n[B] func 1: [00 01 ff 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x01, {0x00, 0x01, 0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    // Вариант C: z=0, R, G, B (только цвет)
+    printf("\n[C] func 1: [00 ff 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x01, {0x00, 0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    // Вариант D: только R G B
+    printf("\n[D] func 1: [ff 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x01, {0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    // Вариант E: с параметром 0xf2 0xe2 как у G HUB
+    printf("\n[E] func 1: [00 00 f2 e2 ff 00 00] (как у G HUB)\n");
+    HidppWrite(g_hDevice, F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    printf("\n=== Пробуем функцию 6 ===\n\n");
+
+    // Вариант F: как G HUB
+    printf("[F] func 6: [00 00 f2 e2 00 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    // Вариант G: с цветом
+    printf("\n[G] func 6: [00 00 f2 e2 ff 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    printf("\n=== Пробуем функцию 3 (эта давала ошибку 0x02) ===\n\n");
+    printf("[H] func 3: [00 01 00 ff 00 00]\n");
+    HidppWrite(g_hDevice, F, 0x03, {0x00, 0x01, 0x00, 0xFF, 0x00, 0x00}, resp);
+    Sleep(500);
+
+    printf("\n=== Смотрим что у нас в других функциях ===\n\n");
+    printf("[I] func 0 (GetZoneCount):\n");
+    HidppWrite(g_hDevice, F, 0x00, {}, resp);
+    Sleep(300);
+
+    printf("\n[J] func 2 (GetZoneEffect?):\n");
+    HidppWrite(g_hDevice, F, 0x02, {0x00}, resp);
+    Sleep(300);
+
+    CloseHandle(g_hDevice);
+
+    printf("\n=== СМОТРИ НА МЫШЬ! ===\n");
+    printf("Если цвет поменялся после какого-то варианта — запиши, какого.\n");
+    printf("Особенно смотри варианты D, E, G.\n");
+    printf("\nPress Enter...\n");
+    getchar();
+    return 0;
+}
