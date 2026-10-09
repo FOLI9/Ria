@@ -1,4 +1,4 @@
-// led_test3.cpp — SET_REPORT Output (как G HUB)
+// led_test4.cpp — SetSWControl + установка цвета
 #include <windows.h>
 #include <setupapi.h>
 #include <hidsdi.h>
@@ -17,7 +17,6 @@ HANDLE OpenHid(const std::wstring& path) {
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
         FILE_FLAG_OVERLAPPED, nullptr);
 }
-
 bool HidRead(HANDLE h, std::vector<BYTE>& buf, DWORD ms) {
     OVERLAPPED ov{}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     DWORD r = 0;
@@ -26,30 +25,22 @@ bool HidRead(HANDLE h, std::vector<BYTE>& buf, DWORD ms) {
     if (WaitForSingleObject(ov.hEvent, ms) != WAIT_OBJECT_0) { CancelIo(h); CloseHandle(ov.hEvent); return false; }
     ok = GetOverlappedResult(h, &ov, &r, FALSE); buf.resize(r); CloseHandle(ov.hEvent); return ok;
 }
-
-void ReadResp(const char* label) {
+void ReadResp() {
     std::vector<BYTE> resp(20);
     if (HidRead(g_hDevice, resp, 500)) {
-        printf("%s", label);
+        printf("    << ");
         for (BYTE b : resp) printf("%02x ", b);
         printf("\n");
-    } else {
-        printf("%s (no data)\n", label);
-    }
+    } else printf("    << (no data)\n");
 }
-
-bool SendOutput(BYTE featureIdx, BYTE func, const std::vector<BYTE>& args) {
+bool SendOutput(BYTE featureIdx, BYTE func, std::vector<BYTE> args) {
     std::vector<BYTE> req(20, 0);
-    req[0] = 0x11;
-    req[1] = 0xFF;
-    req[2] = featureIdx;
+    req[0] = 0x11; req[1] = 0xFF; req[2] = featureIdx;
     req[3] = (BYTE)((func << 4) | 0x01);
     for (size_t i = 0; i < args.size() && i < 16; ++i) req[4 + i] = args[i];
-
     printf("    >> ");
     for (BYTE b : req) printf("%02x ", b);
     printf("\n");
-
     if (!HidD_SetOutputReport(g_hDevice, req.data(), 20)) {
         printf("    SetOutputReport FAILED (err=%lu)\n", GetLastError());
         return false;
@@ -57,7 +48,6 @@ bool SendOutput(BYTE featureIdx, BYTE func, const std::vector<BYTE>& args) {
     printf("    (sent OK)\n");
     return true;
 }
-
 std::wstring FindHidpp(USHORT vid, USHORT* outPid) {
     GUID g; HidD_GetHidGuid(&g);
     HDEVINFO di = SetupDiGetClassDevs(&g, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -96,70 +86,60 @@ std::wstring FindHidpp(USHORT vid, USHORT* outPid) {
 }
 
 int main() {
-    printf("=== LED Test v3: SET_REPORT Output ===\n\n");
-
+    printf("=== LED Test v4: SetSWControl + Color ===\n\n");
     USHORT pid = 0;
     std::wstring path = FindHidpp(0x046d, &pid);
     if (path.empty()) { printf("not found\n"); getchar(); return 1; }
     printf("Found PID=0x%04x\n", pid);
-
     g_hDevice = OpenHid(path);
     if (g_hDevice == INVALID_HANDLE_VALUE) { printf("open failed\n"); getchar(); return 1; }
 
-    const BYTE F = 0x0e;
+    const BYTE F = 0x0e; // feature 0x8071 (RGB Effects)
 
-    printf("\n### 1. func 6 (как G HUB): [00 00 f2 e2 00 00 00] ###\n");
-    SendOutput(F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00});
-    Sleep(100);
-    ReadResp("    << ");
+    // 1. Пробуем "взять контроль" (SetSWControl)
+    printf("\n### 1. SetSWControl (func 5? пробуем) ###\n");
+    SendOutput(F, 0x05, {0x01}); // mode=1 (software control)
+    Sleep(200); ReadResp();
 
-    printf("\n### 2. func 1 (как G HUB): [00 00 f2 e2 00 00 00] ###\n");
-    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0x00});
-    Sleep(100);
-    ReadResp("    << ");
+    printf("\n### 2. SetSWControl (func 1, arg=1) ###\n");
+    SendOutput(F, 0x01, {0x01});
+    Sleep(200); ReadResp();
 
-    printf("\n>>> Цвет изменился? Enter...\n");
-    getchar();
+    printf("\n>>> Мышь мигнула? Enter...\n"); getchar();
 
-    printf("\n### 3. func 6 + func 1, красный (ff 00 00) ###\n");
-    SendOutput(F, 0x06, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
-    Sleep(200);
-    ReadResp("    << ");
-    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
-    Sleep(200);
-    ReadResp("    << ");
+    // 3. Пробуем "взять контроль" через Onboard Profiles (0x8100)
+    printf("\n### 3. Onboard Profiles (0x8100): func 1, arg=1 (host mode?) ###\n");
+    SendOutput(0x0f, 0x01, {0x01});
+    Sleep(300); ReadResp();
 
-    printf("\n>>> Мышь КРАСНАЯ? Enter...\n");
-    getchar();
+    printf("\n### 4. Onboard Profiles: func 1, arg=0 ###\n");
+    SendOutput(0x0f, 0x01, {0x00});
+    Sleep(300); ReadResp();
 
-    printf("\n### 4. func 1: [00 01 FF 00 00] ###\n");
+    printf("\n>>> Режим изменился? Enter...\n"); getchar();
+
+    // 5. Теперь пробуем цвет
+    printf("\n### 5. RED через func 1 ###\n");
     SendOutput(F, 0x01, {0x00, 0x01, 0xFF, 0x00, 0x00});
-    Sleep(200);
-    ReadResp("    << ");
+    Sleep(300); ReadResp();
 
-    printf("\n### 5. func 1: [00 01 00 FF 00 00] ###\n");
+    printf("\n### 6. RED через func 1 с persistence ###\n");
     SendOutput(F, 0x01, {0x00, 0x01, 0x00, 0xFF, 0x00, 0x00});
-    Sleep(200);
-    ReadResp("    << ");
+    Sleep(300); ReadResp();
 
-    printf("\n>>> Мышь КРАСНАЯ? Enter...\n");
-    getchar();
+    printf("\n### 7. RED через func 1 + f2e2 ###\n");
+    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0xFF, 0x00, 0x00});
+    Sleep(300); ReadResp();
 
-    printf("\n### 6. func 1: [00 FF 00 00] ###\n");
-    SendOutput(F, 0x01, {0x00, 0xFF, 0x00, 0x00});
-    Sleep(200);
-    ReadResp("    << ");
+    printf("\n>>> Мышь КРАСНАЯ? Enter...\n"); getchar();
 
-    printf("\n### 7. func 1 синий: [00 00 F2 E2 00 00 FF] ###\n");
-    SendOutput(F, 0x01, {0x00, 0x00, 0xF2, 0xE2, 0x00, 0x00, 0xFF});
-    Sleep(200);
-    ReadResp("    << ");
+    // 8. Синий
+    printf("\n### 8. BLUE ###\n");
+    SendOutput(F, 0x01, {0x00, 0x01, 0x00, 0x00, 0xFF});
+    Sleep(300); ReadResp();
 
-    printf("\n>>> Мышь СИНЯЯ? Enter...\n");
-    getchar();
+    printf("\n>>> Мышь СИНЯЯ? Enter...\n"); getchar();
 
     CloseHandle(g_hDevice);
-    printf("\nDone.\n");
-    getchar();
-    return 0;
+    printf("\nDone.\n"); getchar(); return 0;
 }
